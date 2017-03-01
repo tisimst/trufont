@@ -2,7 +2,6 @@ from booleanOperations.booleanGlyph import BooleanGlyph
 from defcon import (
     Font, Layer, Glyph, Groups, Kerning, Contour, Point, Anchor, Component,
     Guideline, Image)
-from defcon.objects.base import BaseObject
 from fontTools.misc.transform import Identity
 from PyQt5.QtCore import pyqtSignal, QObject
 from PyQt5.QtWidgets import QApplication
@@ -174,6 +173,23 @@ class TLayer(Layer):
 
         return glyph
 
+    def _glyphsReloadFilter(self, glyphNames):
+        for glyphName in glyphNames:
+            if glyphName in self and self[glyphName].template:
+                continue
+            if glyphName not in self._glyphSet:
+                # TODO: blindy treating every KeyError as a "former"
+                # template glyph isn't particularly elegant.
+                glyph = self[glyphName]
+                glyph.clear()
+                glyph.template = True
+                glyph.dirty = False
+                continue
+            yield glyphName
+
+    def reloadGlyphs(self, glyphNames):
+        super().reloadGlyphs(self._glyphsReloadFilter(glyphNames))
+
     def saveGlyph(self, glyph, glyphSet, saveAs=False):
         if not glyph.template:
             super().saveGlyph(glyph, glyphSet, saveAs)
@@ -221,6 +237,11 @@ class TGlyph(Glyph):
         super().endSelfComponentNotificationObservation(component)
 
     # observe contours selection
+
+    def selfNotificationCallback(self, notification):
+        super().selfNotificationCallback(notification)
+        if notification.name == "Glyph.Changed" and self.dirty:
+            self.template = False
 
     def beginSelfContourNotificationObservation(self, contour):
         if contour.dispatcher is None:
@@ -281,13 +302,6 @@ class TGlyph(Glyph):
     template = property(
         _get_template, _set_template,
         doc="A boolean indicating whether the glyph is a template glyph.")
-
-    def _set_dirty(self, value):
-        BaseObject._set_dirty(self, value)
-        if value:
-            self.template = False
-
-    dirty = property(BaseObject._get_dirty, _set_dirty)
 
     def _get_side1KerningGroup(self):
         font = self.font

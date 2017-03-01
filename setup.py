@@ -7,7 +7,7 @@ with open('README.rst', 'r', encoding="utf-8") as f:
 
 setup(
     name="trufont",
-    version="0.5.0",
+    version="0.6.0.dev0",
     description="TruFont, a modular and cross-platform font editor.",
     long_description=long_description,
     author="Adrien Tétar",
@@ -26,11 +26,11 @@ setup(
         "fonttools>=3.3.1",
         "ufoLib>=2.0.0",
         "defcon>=0.2.0",
-        "defconQt>=0.2.0",
+        "defconQt>=0.3.0",
         "ufo-extractor>=0.2.0",
         "ufo2ft>=0.3.2",
         "booleanOperations>=0.6.4",
-        "husl",
+        "hsluv>=0.0.2",
     ],
     platforms=["Linux", "Win32", "Mac OS X"],
     classifiers=[

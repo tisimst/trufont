@@ -11,6 +11,14 @@ import sys
 def treatPackageAsFile():
     return sys.platform == "darwin"
 
+# -----
+# Fonts
+# -----
+
+
+def fontSizeDelta():
+    return int(sys.platform == "darwin")
+
 # -------------
 # Key sequences
 # -------------
@@ -97,10 +105,6 @@ def useTabBar():
 def showAppIconInDialog():
     return sys.platform == "darwin"
 
-
-def useCenteredButtons():
-    return sys.platform == "darwin"
-
 # -----------
 # Rubber band
 # -----------
@@ -116,7 +120,8 @@ def needsCustomRubberBand():
 
 def appStyleSheet():
     if sys.platform == "win32":
-        return "QStatusBar::item { border: none; }"
+        return "QStatusBar::item { border: none; } QWidget { \
+            font-family: 'Segoe UI', sans-serif; font-size: 9pt; }"
     elif sys.platform == "darwin":
         return "QToolTip { background-color: white; }"
     return None
