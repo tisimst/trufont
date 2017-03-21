@@ -1,4 +1,4 @@
-from booleanOperations.booleanGlyph import BooleanGlyph
+from booleanOperations import union
 from defcon import (
     Font, Layer, Glyph, Groups, Kerning, Contour, Point, Anchor, Component,
     Guideline, Image)
@@ -6,8 +6,20 @@ from fontTools.misc.transform import Identity
 from PyQt5.QtCore import pyqtSignal, QObject
 from PyQt5.QtWidgets import QApplication
 from trufont.objects import settings
+from ufo2ft import compileOTF, compileTTF
 import fontTools
 import math
+
+_shaper = True
+try:
+    import harfbuzz  # noqa
+    from trufont.objects.layoutEngine import LayoutEngine
+except ImportError:
+    try:
+        import compositor  # noqa
+        from defcon import LayoutEngine
+    except ImportError:
+        _shaper = False
 
 
 class TFont(Font):
@@ -30,12 +42,23 @@ class TFont(Font):
             if attr not in kwargs:
                 kwargs[attr] = defaultClass
         super().__init__(*args, **kwargs)
+        self._engine = None
+
+    def __repr__(self):
+        return "<%s %s %s>" % (
+            self.__class__.__name__, self.info.familyName, self.info.styleName)
 
     @property
     def binaryPath(self):
         if hasattr(self, "_binaryPath"):
             return self._binaryPath
         return None
+
+    @property
+    def engine(self):
+        if _shaper and self._engine is None:
+            self._engine = LayoutEngine(self)
+        return self._engine
 
     @classmethod
     def new(cls):
@@ -96,9 +119,19 @@ class TFont(Font):
         self.dirty = False
         app.postNotification("fontSaved", data)
 
-    def export(self, path, format="otf"):
-        if format not in ("otf", "ttf"):
-            raise ValueError("unknown format: %s")
+    def export(self, path, format="otf", compression=None, **kwargs):
+        if format == "otf":
+            func = compileOTF
+        elif format == "ttf":
+            func = compileTTF
+        else:
+            raise ValueError("unknown format: %s" % format)
+        if compression is not None:
+            invalid = compression - {"none", "woff", "woff2"}
+            if invalid:
+                raise ValueError(
+                    "unknown compression format: {}".format(invalid))
+        # info attrs
         missingAttrs = []
         for attr in ("familyName", "styleName", "unitsPerEm", "ascender",
                      "descender", "xHeight", "capHeight"):
@@ -111,13 +144,21 @@ class TFont(Font):
         app = QApplication.instance()
         data = dict(
             font=self,
-            format=format,
             path=path,
+            format=format,
+            compression=compression,
+            kwargs=kwargs,
         )
-        rp = "TruFont.QuadraticTTFont" if format == "ttf" else "TruFont.TTFont"
         app.postNotification("fontWillExport", data)
-        otf = self.getRepresentation(rp)
-        otf.save(path)
+        otf = func(self, **kwargs)
+        if compression is None or "none" in compression:
+            otf.save(path)
+        if compression is not None:
+            for header in compression:
+                if header == "none":
+                    continue
+                otf.flavor = header
+                otf.save("{}.{}".format(path, header))
         app.postNotification("fontExported", data)
 
     # sort descriptor
@@ -201,6 +242,10 @@ class TGlyph(Glyph):
         super().__init__(*args, **kwargs)
         self._template = False
         self._undoManager = UndoManager(self)
+
+    def __repr__(self):
+        return "<%s %s (%s)>" % (
+            self.__class__.__name__, self.name, self.layer.name)
 
     # observe anchor selection
 
@@ -345,35 +390,42 @@ class TGlyph(Glyph):
             return
         self.unicodes = [uni]
 
+    def rename(self, newName):
+        if self.layerSet is not None:
+            font = self.font
+            oldName = self.name
+            font.disableNotifications()
+            for layer in self.layerSet:
+                if oldName in layer:
+                    glyph = layer[oldName]
+                    glyph.name = newName
+            font.enableNotifications()
+        else:
+            self.name = newName
+
     def hasOverlap(self):
-        bGlyph = BooleanGlyph()
-        pen = bGlyph.getPointPen()
-        openContours = 0
+        closed = []
+        length = len(self)
         for contour in self:
-            if not contour.open:
-                contour.drawPoints(pen)
+            if contour.open:
+                length -= 1
             else:
-                openContours += 1
-        bGlyph.removeOverlap()
-        return len(bGlyph.contours) + openContours != len(self)
+                closed.append(contour)
+        glyph = self.__class__()
+        union(closed, glyph.getPointPen())
+        return len(glyph) != length
 
     def removeOverlap(self):
         # TODO: maybe clear undo stack if no changes
         self.prepareUndo()
-        bGlyph = BooleanGlyph()
-        pen = bGlyph.getPointPen()
-        for contour in list(self):
-            if not contour.open:
-                contour.drawPoints(pen)
-                self.removeContour(contour)
-            else:
-                contour.selected = False
-        bGlyph = bGlyph.removeOverlap()
-        pen = self.getPointPen()
-        for contour in bGlyph.contours:
-            contour.drawPoints(pen)
-
-        self.dirty = True
+        open_, closed = [], []
+        for contour in self:
+            (open_ if contour.open else closed).append(contour)
+        self.clearContours()
+        pointPen = self.getPointPen()
+        union(closed, pointPen)
+        for contour in open_:
+            contour.drawPoints(pointPen)
 
     def scale(self, pt, center=(0, 0)):
         for contour in self:

@@ -1,9 +1,7 @@
-from defconQt.controls.colorVignette import ColorVignette
 from PyQt5.QtCore import QEvent, Qt
 from PyQt5.QtWidgets import (
     QDialog, QDialogButtonBox, QGridLayout, QLabel, QLineEdit, QListWidget,
     QRadioButton)
-from trufont.tools.colorGenerator import ColorGenerator
 
 
 class FindDialog(QDialog):
@@ -106,45 +104,6 @@ class AddComponentDialog(FindDialog):
         self.updateGlyphList()
 
 
-class AddLayerDialog(QDialog):
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowModality(Qt.WindowModal)
-        self.setWindowTitle(self.tr("Add layer…"))
-
-        layout = QGridLayout(self)
-
-        layerNameLabel = QLabel(self.tr("Layer name:"), self)
-        self.layerNameEdit = QLineEdit(self)
-        self.layerNameEdit.setFocus(True)
-        self.layerColorVignette = ColorVignette(self)
-        self.layerColorVignette.setColor(LayerColorGenerator.getQColor())
-
-        buttonBox = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttonBox.accepted.connect(self.accept)
-        buttonBox.rejected.connect(self.reject)
-
-        l = 0
-        layout.addWidget(layerNameLabel, l, 0)
-        layout.addWidget(self.layerNameEdit, l, 1)
-        layout.addWidget(self.layerColorVignette, l, 2)
-        l += 1
-        layout.addWidget(buttonBox, l, 0, 1, 3)
-        self.setLayout(layout)
-
-    @classmethod
-    def getNewLayerNameAndColor(cls, parent):
-        dialog = cls(parent)
-        result = dialog.exec_()
-        name = dialog.layerNameEdit.text()
-        color = dialog.layerColorVignette.color()
-        if not result:
-            LayerColorGenerator.revert()
-        return (name, color.getRgbF(), result)
-
-
 class LayerActionsDialog(QDialog):
 
     def __init__(self, currentGlyph, parent=None):
@@ -212,7 +171,7 @@ class RenameDialog(QDialog):
 
         nameLabel = QLabel(self.tr("Name:"), self)
         self.nameEdit = QLineEdit(self)
-        self.nameEdit.setFocus(True)
+        self.nameEdit.setFocus(Qt.OtherFocusReason)
 
         buttonBox = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -235,33 +194,3 @@ class RenameDialog(QDialog):
         result = dialog.exec_()
         name = dialog.nameEdit.text()
         return (name, result)
-
-# ---------------
-# Color generator
-# ---------------
-
-
-class LayerColorGenerator(ColorGenerator):
-    # precomputed colors fancy/k-means
-    colors = [
-        (185, 225, 122),
-        (158, 206, 228),
-        (233, 174, 200),
-        (227, 191, 206),
-        (130, 223, 184)
-    ]
-    index = 0
-
-    @classmethod
-    def getColor(cls):
-        if cls.index <= len(cls.colors):
-            color = (clr / 255 for clr in cls.colors[cls.index])
-        else:
-            color = ColorGenerator.getColor()
-        cls.index += 1
-        return color
-
-    @classmethod
-    def revert(cls):
-        if cls.index > 0:
-            cls.index -= 1

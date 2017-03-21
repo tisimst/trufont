@@ -58,10 +58,10 @@ class RulerTool(BaseTool):
         self._rulerPts = None
         self.parent().update()
 
-    def drawingAttribute(self, attr, layerName):
-        if layerName is None and attr == "showGlyphPointCoordinates":
+    def drawingAttribute(self, attr, flags):
+        if flags.isActiveLayer and attr == "showGlyphPointCoordinates":
             return True
-        return super().drawingAttribute(attr, layerName)
+        return super().drawingAttribute(attr, flags)
 
     # custom methods
 
@@ -110,13 +110,12 @@ class RulerTool(BaseTool):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.LeftButton:
+            pos = self.magnetPos(event.localPos())
             if self._rulerObject is None:
-                self.mousePressEvent(event)
+                self._rulerObject = (QLineF(pos, pos), "0.0º")
                 return
             line, _ = self._rulerObject
-            pos = event.localPos()
-            # magnet before clamping to axis
-            pos = self.magnetPos(pos)
+            # magnet done before clamping to axis
             if event.modifiers() & Qt.ShiftModifier:
                 pos = self.clampToOrigin(pos, line.p1())
             line.setP2(pos)
@@ -146,8 +145,10 @@ class RulerTool(BaseTool):
 
     # custom painting
 
-    def paint(self, painter):
+    def paint(self, painter, index):
         widget = self.parent()
+        if index != widget.activeIndex():
+            return
         scale = widget.inverseScale()
         # metrics
         if self._rulerObject is not None:

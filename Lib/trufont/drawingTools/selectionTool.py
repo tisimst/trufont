@@ -11,8 +11,6 @@ from trufont.tools.uiMethods import (
     maybeProjectUISmoothPointOffcurve, moveUIGlyphElements,
     unselectUIGlyphElements)
 
-from trufont.tools.UIMove_ng import UIMove
-
 arrowKeys = (Qt.Key_Left, Qt.Key_Up, Qt.Key_Right, Qt.Key_Down)
 navKeys = (Qt.Key_Less, Qt.Key_Greater)
 
@@ -56,7 +54,7 @@ def _pointWithinThreshold(x, y, curve, eps):
 
 class SelectionTool(BaseTool):
     icon = _path
-    name = QApplication.translate("SelectionTool", "Selection")
+    name = QApplication.translate("SelectionTool", "Select")
     shortcut = "V"
 
     def __init__(self, parent=None):
@@ -110,9 +108,7 @@ class SelectionTool(BaseTool):
         font = self._glyph.font
         if glyphName in font:
             glyph = font[glyphName]
-            # XXX: coupling. we need currentFontWindow() or font.window
-            # or windowForFont()?
-            fontWindow = widget.parent().parent().parent().parent()
+            fontWindow = widget.window()
             fontWindow.openGlyphTab(glyph)
 
     def _toggleGuideline(self, guideline):
@@ -179,7 +175,7 @@ class SelectionTool(BaseTool):
         if segmentTuple is None:
             segmentTuple = self._findSegmentUnderMouse(pos, action)
         if segmentTuple is None:
-            return
+            return False
         segment, contour = segmentTuple
         prev, point = segment[0], segment[-1]
         if point.segmentType == "line":
@@ -194,20 +190,15 @@ class SelectionTool(BaseTool):
                         index+i, point.__class__((xt, yt)))
                 point.segmentType = "curve"
                 contour.releaseHeldNotifications()
-                return
+                return True
         elif point.segmentType not in ("curve", "qcurve"):
-            return
+            return True
         if action == "selectContour":
             contour.selected = not contour.selected
             self._shouldMove = self._shouldPrepareUndo = True
+        return True
 
     def _maybeJoinContour(self, pos):
-        def getAtEdge(contour, pt):
-            for index in range(2):
-                if contour[index-1] == pt:
-                    return index - 1
-            return None
-
         if self._mouseItem is None or not isinstance(self._mouseItem, tuple):
             return
         contour, index = self._mouseItem
@@ -351,11 +342,10 @@ class SelectionTool(BaseTool):
         if key in arrowKeys:
             # TODO: prune
             self._glyph.prepareUndo()
-            delta = self._moveForEvent(event)
+            dx, dy = self._moveForEvent(event)
             modifiers = event.modifiers()
             slidePoints = modifiers & Qt.AltModifier
-            for contour in self._glyph:
-                UIMove(contour, delta, slidePoints=slidePoints)
+            moveUIGlyphElements(self._glyph, dx, dy, slidePoints=slidePoints)
         # TODO: nav shouldn't be specific to this tool
         elif key in navKeys:
             pack = self._getSelectedCandidatePoint()
@@ -372,7 +362,7 @@ class SelectionTool(BaseTool):
             changed = False
             for contour in self._glyph:
                 for index, point in enumerate(contour):
-                    if point.segmentType is not None:
+                    if point.segmentType is not None and point.selected:
                         if all(contour.getPoint(
                                 index + d).segmentType for d in (-1, 1)):
                             continue
@@ -508,11 +498,21 @@ class SelectionTool(BaseTool):
             elif isinstance(item, (Anchor, Guideline)):
                 self._renameItem(item)
         else:
-            self._performSegmentClick(event.localPos(), "selectContour")
+            if self._performSegmentClick(event.localPos(), "selectContour"):
+                return
+            index = widget.indexForPoint(
+                widget.mapFromCanvas(event.localPos()))
+            if index is not None:
+                widget.setActiveIndex(index)
+                # since we shuffle the coordinates system, flush the rubber
+                # band
+                self._rubberBandRect = None
 
     # custom painting
 
-    def paintBackground(self, painter):
+    def paintBackground(self, painter, index):
+        if index != self.parent().activeIndex():
+            return
         if self._oldPath is not None:
             # XXX: honor partialAliasing
             painter.save()
@@ -523,23 +523,14 @@ class SelectionTool(BaseTool):
             painter.drawPath(self._oldPath)
             painter.restore()
 
-    def paint(self, painter):
+    def paint(self, painter, index):
         if self._rubberBandRect is None:
             return
         widget = self.parent()
+        if index != widget.activeIndex():
+            return
         rect = self._rubberBandRect
-        # TODO: maybe extract this to drawRubberBand
-        if platformSpecific.needsCustomRubberBand():
-            highlight = widget.palette(
-                ).color(QPalette.Active, QPalette.Highlight)
-            painter.save()
-            painter.setRenderHint(QPainter.Antialiasing, False)
-            painter.setPen(highlight.darker(120))
-            highlight.setAlphaF(.35)
-            painter.setBrush(highlight)
-            painter.drawRect(rect)
-            painter.restore()
-        else:
+        if platformSpecific.useBuiltinRubberBand():
             # okay, OS-native rubber band does not support painting with
             # floating-point coordinates
             # paint directly on the widget with unscaled context
@@ -555,4 +546,17 @@ class SelectionTool(BaseTool):
             painter.resetTransform()
             widget.style().drawControl(
                 QStyle.CE_RubberBand, option, painter, widget)
+            painter.restore()
+        else:
+            highlight = widget.palette(
+                ).color(QPalette.Active, QPalette.Highlight)
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, False)
+            pen = painter.pen()
+            pen.setColor(highlight.darker(120))
+            pen.setWidth(0)
+            painter.setPen(pen)
+            highlight.setAlphaF(.35)
+            painter.setBrush(highlight)
+            painter.drawRect(rect)
             painter.restore()

@@ -1,10 +1,12 @@
-from PyQt5.QtCore import QEvent, QMimeData, QSize, QStandardPaths, Qt
+from PyQt5.QtCore import QEvent, QMimeData, QObject, QSize, QStandardPaths, Qt
 from PyQt5.QtGui import QColor, QKeySequence, QPainter, QPainterPath
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QMessageBox, QShortcut,
     QStackedWidget, QVBoxLayout, QWidget)
 from defconQt.controls.glyphCellView import GlyphCellView
 from defconQt.windows.baseWindows import BaseWindow
+from fontTools.feaLib.error import FeatureLibError
+from trufont.controls.exportDialog import ExportDialog
 from trufont.controls.fileMessageBoxes import CloseMessageBox, ReloadMessageBox
 from trufont.controls.fontDialogs import AddGlyphsDialog, SortDialog
 from trufont.controls.glyphCanvasView import GlyphCanvasView
@@ -20,6 +22,7 @@ from trufont.tools.uiMethods import deleteUISelection, removeUIGlyphElements
 from trufont.windows.fontFeaturesWindow import FontFeaturesWindow
 from trufont.windows.fontInfoWindow import FontInfoWindow
 from trufont.windows.groupsWindow import GroupsWindow
+from trufont.windows.kerningWindow import KerningWindow
 from trufont.windows.metricsWindow import MetricsWindow
 from ufoLib.glifLib import readGlyphFromString
 from collections import OrderedDict
@@ -44,6 +47,12 @@ _path.lineTo(5, 20)
 _path.closeSubpath()
 
 
+def _textForGlyphs(glyphs):
+    return "".join(
+        chr(glyph.unicode) if glyph.unicode is not None else
+        "/{} ".format(glyph.name) for glyph in glyphs)
+
+
 class PageWidget(QWidget):
 
     def __init__(self, parent=None):
@@ -60,6 +69,25 @@ class PageWidget(QWidget):
         painter.fillRect(event.rect(), QColor(235, 235, 235))
 
 
+class PreviewEventFilter(QObject):
+    filterKeyEvents = (
+        QEvent.ShortcutOverride, QEvent.KeyPress, QEvent.KeyRelease)
+
+    def eventFilter(self, obj, event):
+        if not obj.isWidgetType():
+            return False
+        # or should we reset on WindowActivate?
+        if event.type() == QEvent.WindowDeactivate:
+            self.parent()._setGlyphPreview(False)
+        if event.type() in self.filterKeyEvents:
+            if not event.isAutoRepeat() and event.key() == Qt.Key_Space:
+                self.parent()._setGlyphPreview(
+                    event.type() != QEvent.KeyRelease)
+                event.accept()
+                return True
+        return False
+
+
 class FontWindow(BaseWindow):
 
     def __init__(self, font, parent=None):
@@ -68,8 +96,9 @@ class FontWindow(BaseWindow):
 
         self._infoWindow = None
         self._featuresWindow = None
-        self._metricsWindow = None
         self._groupsWindow = None
+        self._kerningWindow = None
+        self._metricsWindow = None
 
         self.toolBar = ToolBar(self)
         self.toolBar.setTools(
@@ -81,7 +110,6 @@ class FontWindow(BaseWindow):
         self.glyphCellView.selectionChanged.connect(self._selectionChanged)
         self.glyphCellView.setAcceptDrops(True)
         self.glyphCellView.setCellRepresentationName("TruFont.GlyphCell")
-        # TODO: check this on non-Windows platforms
         self.glyphCellView.setFrameShape(self.glyphCellView.NoFrame)
         self.glyphCellView.setFocus()
 
@@ -101,7 +129,7 @@ class FontWindow(BaseWindow):
         self.propertiesView = PropertiesView(self)
         self.propertiesView.hide()
 
-        self.statusBar = StatusBar()
+        self.statusBar = StatusBar(self)
         self.statusBar.setMinimumSize(32)
         self.statusBar.setMaximumSize(128)
         self.statusBar.sizeChanged.connect(self._sizeChanged)
@@ -114,7 +142,7 @@ class FontWindow(BaseWindow):
         app.dispatcher.addObserver(
             self, "_drawingToolUnregistered", "drawingToolUnregistered")
         app.dispatcher.addObserver(
-            self, "_glyphViewGlyphChanged", "glyphViewGlyphChanged")
+            self, "_glyphViewGlyphsChanged", "glyphViewGlyphsChanged")
 
         layout = QHBoxLayout(self)
         layout.addWidget(self.toolBar)
@@ -138,9 +166,14 @@ class FontWindow(BaseWindow):
             ("Shift+" + QKeySequence(
                 QKeySequence.Delete).toString(), self.delete),
         ]
+        e = platformSpecific.altDeleteSequence()
+        if e is not None:
+            elements.append((e, self.delete))
         for keys, callback in elements:
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.activated.connect(callback)
+
+        self.installEventFilter(PreviewEventFilter(self))
 
         self.readSettings()
         self.statusBar.sizeChanged.connect(self.writeSettings)
@@ -238,6 +271,7 @@ class FontWindow(BaseWindow):
 
         windowMenu = menuBar.fetchMenu(Entries.Window)
         windowMenu.fetchAction(Entries.Window_Groups, self.groups)
+        windowMenu.fetchAction(Entries.Window_Kerning, self.kerning)
         windowMenu.fetchAction(Entries.Window_Metrics, self.metrics)
         windowMenu.fetchAction(Entries.Window_Scripting)
         windowMenu.fetchAction(Entries.Window_Properties, self.properties)
@@ -292,22 +326,21 @@ class FontWindow(BaseWindow):
             if not index:
                 continue
             view = self.stackWidget.widget(index)
-            if view.widget().glyph() == glyph:
+            if list(view.glyphs()) == [glyph]:
                 self.tabWidget.setCurrentTab(index)
                 return
         # spawn
         widget = GlyphCanvasView(self)
-        # TODO: this should be in the widget
-        widget.setFrameShape(widget.NoFrame)
-        widget.setGlyph(glyph)
+        widget.setInputNames([glyph.name])
+        widget.activeGlyphChanged.connect(self._selectionChanged)
+        widget.glyphNamesChanged.connect(self._namesChanged)
         widget.pointSizeModified.connect(self.statusBar.setSize)
+        widget.toolModified.connect(self.toolBar.setCurrentTool)
         # add
-        self.tabWidget.addTab(glyph.name)
+        self.tabWidget.addTab(_textForGlyphs([glyph]))
         self.stackWidget.addWidget(widget)
         # activate
         self.tabWidget.setCurrentTab(-1)
-        # XXX: drop the need for this, i.e. catch keys in the window
-        widget.setFocus(True)
 
     def closeGlyphTab(self):
         index = self.stackWidget.currentIndex()
@@ -347,17 +380,15 @@ class FontWindow(BaseWindow):
         raise ValueError(
             "couldn't find tool to unregister: {}".format(toolClass))
 
-    def _glyphViewGlyphChanged(self, notification):
+    def _glyphViewGlyphsChanged(self, notification):
         self._updateGlyphActions()
-        index = self.stackWidget.currentIndex()
-        if not index:
-            return
-        widget = self.stackWidget.currentWidget()
-        glyph = widget.glyph()
-        # XXX: subscribe to Glyph.NameChanged
-        self.tabWidget.setTabName(index, glyph.name)
 
     # widgets
+
+    def _namesChanged(self):
+        sender = self.sender()
+        index = self.stackWidget.indexOf(sender)
+        self.tabWidget.setTabName(index, _textForGlyphs(sender.glyphs()))
 
     def _sizeChanged(self):
         size = self.statusBar.size()
@@ -371,11 +402,12 @@ class FontWindow(BaseWindow):
         self.statusBar.setShouldPropagateSize(not index)
         # we need to hide, then setParent, then show
         self.stackWidget.currentWidget().hide()
+        newWidget = self.stackWidget.widget(index)
         if index:
-            parent = self.stackWidget.widget(index).widget()
             for tool in self.toolBar.tools():
-                tool.setParent(parent)
+                tool.setParent(newWidget)
         self.stackWidget.setCurrentIndex(index)
+        newWidget.setFocus(Qt.OtherFocusReason)
 
     def _toolChanged(self, tool):
         widget = self.stackWidget.currentWidget()
@@ -392,7 +424,7 @@ class FontWindow(BaseWindow):
         self._updateGlyphActions()
         # update slider
         if self.isGlyphTab():
-            lo, hi, unit = 600, 12000, " pt"
+            lo, hi, unit = 0, 900000, " pt"
             widget = self.stackWidget.currentWidget()
             size = widget.pointSize()
         else:
@@ -420,25 +452,28 @@ class FontWindow(BaseWindow):
         self._font.glyphOrder = [glyph.name for glyph in glyphs]
 
     def _selectionChanged(self):
-        # currentGlyph
-        lastSelectedGlyph = self.glyphCellView.lastSelectedGlyph()
-        app = QApplication.instance()
-        app.setCurrentGlyph(lastSelectedGlyph)
-        # selection text
-        # TODO: this should probably be internal to the label
-        selection = self.glyphCellView.selection()
-        if selection is not None:
-            count = len(selection)
-            if count == 1:
-                glyph = self.glyphCellView.glyphsForIndexes(selection)[0]
-                text = "%s " % glyph.name
+        if self.isGlyphTab():
+            activeGlyph = self.stackWidget.currentWidget().activeGlyph()
+        else:
+            activeGlyph = self.glyphCellView.lastSelectedGlyph()
+            # selection text
+            # TODO: this should probably be internal to the label
+            selection = self.glyphCellView.selection()
+            if selection is not None:
+                count = len(selection)
+                if count == 1:
+                    glyph = self.glyphCellView.glyphsForIndexes(selection)[0]
+                    text = "%s " % glyph.name
+                else:
+                    text = ""
+                if count:
+                    text = self.tr("{0}(%n selected)".format(text), n=count)
             else:
                 text = ""
-            if count:
-                text = self.tr("{0}(%n selected)".format(text), n=count)
-        else:
-            text = ""
-        self.statusBar.setText(text)
+            self.statusBar.setText(text)
+        # currentGlyph
+        app = QApplication.instance()
+        app.setCurrentGlyph(activeGlyph)
         # actions
         self._updateGlyphActions()
 
@@ -449,7 +484,9 @@ class FontWindow(BaseWindow):
         self.setWindowModified(font.dirty)
 
     def _glyphOrderChanged(self, notification):
-        self._updateGlyphsFromGlyphOrder()
+        font = notification.object
+        glyphs = [font[name] for name in font.glyphOrder]
+        self.glyphCellView.setGlyphs(glyphs)
 
     def _updateGlyphsFromGlyphOrder(self):
         font = self._font
@@ -531,6 +568,8 @@ class FontWindow(BaseWindow):
             nameFilter = dialog.selectedNameFilter()
             path = dialog.selectedFiles()[0]
             self.saveFile(path, fileFormats[nameFilter])
+            app = QApplication.instance()
+            app.setCurrentFile(self._font.path)
             self.setWindowTitle(self.fontTitle())
         # return ok
 
@@ -556,38 +595,29 @@ class FontWindow(BaseWindow):
             self.setFont_(font_)
 
     def exportFile(self):
-        fileFormats = [
-            (self.tr("PostScript OT font {}").format("(*.otf)")),
-            (self.tr("TrueType OT font {}").format("(*.ttf)")),
-        ]
-        state = settings.exportFileDialogState()
-        # TODO: font.path as default?
-        # TODO: store per-font export path in lib
-        directory = None if state else QStandardPaths.standardLocations(
-            QStandardPaths.DocumentsLocation)[0]
-        dialog = QFileDialog(
-            self, self.tr("Export File"), directory,
-            ";;".join(fileFormats))
-        if state:
-            dialog.restoreState(state)
-        dialog.setAcceptMode(QFileDialog.AcceptSave)
-        ok = dialog.exec_()
-        settings.setExportFileDialogState(dialog.saveState())
-        if ok:
-            fmt = "ttf" if dialog.selectedNameFilter(
-                ) == fileFormats[1] else "otf"
-            path = dialog.selectedFiles()[0]
+        params, ok = ExportDialog.getExportParameters(self, self._font)
+        if not ok:
+            return
+        baseName = params['baseName']
+        directory = params['exportDirectory']
+        compression = set(map(str.lower, params['compression']))
+        for format in map(str.lower, params['formats']):
+            fileName = "{}.{}".format(baseName, format)
+            path = os.path.join(directory, fileName)
             try:
-                self._font.export(path, fmt)
+                self._font.export(path, format, compression=compression)
             except Exception as e:
-                errorReports.showCriticalException(e)
+                msg = self.tr(
+                    "This font’s feature file contains an error."
+                    ) if isinstance(e, FeatureLibError) else None
+                errorReports.showCriticalException(e, message=msg)
 
     # Edit
 
     def undo(self):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
         else:
             glyph = widget.lastSelectedGlyph()
         glyph.undo()
@@ -595,7 +625,7 @@ class FontWindow(BaseWindow):
     def redo(self):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
         else:
             glyph = widget.lastSelectedGlyph()
         glyph.redo()
@@ -604,7 +634,7 @@ class FontWindow(BaseWindow):
         self.copy()
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             deleteUISelection(glyph)
         else:
             glyphs = widget.glyphs()
@@ -618,7 +648,7 @@ class FontWindow(BaseWindow):
         clipboard = QApplication.clipboard()
         mimeData = QMimeData()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             copyGlyph = glyph.getRepresentation("TruFont.FilterSelection")
             packGlyphs = (copyGlyph,)
         else:
@@ -629,7 +659,7 @@ class FontWindow(BaseWindow):
         pickled = []
         for glyph in packGlyphs:
             pickled.append(glyph.serialize(
-                blacklist=("name", "unicode")
+                blacklist=("name", "unicodes")
             ))
         mimeData.setData("application/x-trufont-glyph-data",
                          pickle.dumps(pickled))
@@ -656,7 +686,7 @@ class FontWindow(BaseWindow):
         isGlyphTab = self.isGlyphTab()
         widget = self.stackWidget.currentWidget()
         if isGlyphTab:
-            glyphs = (widget.glyph(),)
+            glyphs = (widget.activeGlyph(),)
         else:
             selection = self.glyphCellView.selection()
             glyphs = widget.glyphsForIndexes(selection)
@@ -707,7 +737,7 @@ class FontWindow(BaseWindow):
     def selectAll(self):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             if glyph.selected:
                 for anchor in glyph.anchors:
                     anchor.selected = True
@@ -721,7 +751,7 @@ class FontWindow(BaseWindow):
     def deselect(self):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             for anchor in glyph.anchors:
                 anchor.selected = False
             for component in glyph.components:
@@ -734,7 +764,7 @@ class FontWindow(BaseWindow):
         modifiers = QApplication.keyboardModifiers()
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             # TODO: fuse more the two methods, they're similar and delete is
             # Cut except not putting in the clipboard
             if modifiers & Qt.AltModifier:
@@ -750,20 +780,23 @@ class FontWindow(BaseWindow):
                 glyphs = widget.glyphsForIndexes(widget.selection())
                 for glyph in glyphs:
                     font = glyph.font
-                    if erase:
-                        del font[glyph.name]
-                    else:
-                        # TODO: consider doing that in glyph template setter
-                        glyph.clear()
-                        glyph.template = True
+                    for layer in font.layers:
+                        if glyph.name in layer:
+                            defaultLayer = layer[glyph.name] == glyph
+                            if defaultLayer and not erase:
+                                # TODO: clear in glyph.template setter?
+                                glyph.clear()
+                                glyph.template = True
+                            else:
+                                del layer[glyph.name]
 
     def findGlyph(self):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
             newGlyph, ok = FindDialog.getNewGlyph(self, glyph)
             if ok and newGlyph is not None:
-                widget.setGlyph(newGlyph)
+                widget.setActiveGlyph(newGlyph)
         else:
             pass  # XXX
 
@@ -772,7 +805,8 @@ class FontWindow(BaseWindow):
     def zoom(self, step):
         if self.isGlyphTab():
             widget = self.stackWidget.currentWidget()
-            widget.zoom(step)
+            newScale = widget.scale() * pow(1.2, step)
+            widget.zoom(newScale)
         else:
             value = self.statusBar.size()
             newValue = value + 10 * step
@@ -795,7 +829,7 @@ class FontWindow(BaseWindow):
     def glyphOffset(self, value):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            currentGlyph = widget.glyph()
+            currentGlyph = widget.activeGlyph()
             font = currentGlyph.font
             glyphOrder = font.glyphOrder
             # should be enforced in fontView already
@@ -804,7 +838,7 @@ class FontWindow(BaseWindow):
             index = glyphOrder.index(currentGlyph.name)
             newIndex = (index + value) % len(glyphOrder)
             glyph = font[glyphOrder[newIndex]]
-            widget.setGlyph(glyph)
+            widget.setActiveGlyph(glyph)
         else:
             lastSelectedCell = widget.lastSelectedCell()
             if lastSelectedCell is None:
@@ -817,7 +851,7 @@ class FontWindow(BaseWindow):
     def layerOffset(self, value):
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            currentGlyph = widget.glyph()
+            currentGlyph = widget.activeGlyph()
             layerSet, layer = currentGlyph.layerSet, currentGlyph.layer
             if None in (layerSet, layer):
                 return
@@ -832,7 +866,7 @@ class FontWindow(BaseWindow):
                 glyph = layer_[currentGlyph.name]
             else:
                 glyph = layer_.newGlyph(currentGlyph.name)
-            widget.setGlyph(glyph)
+            widget.setActiveGlyph(glyph)
 
     # Font
 
@@ -891,6 +925,14 @@ class FontWindow(BaseWindow):
             self._groupsWindow = GroupsWindow(self._font, self)
             self._groupsWindow.show()
 
+    def kerning(self):
+        # TODO: see up here
+        if self._kerningWindow is not None and self._kerningWindow.isVisible():
+            self._kerningWindow.raise_()
+        else:
+            self._kerningWindow = KerningWindow(self._font, self)
+            self._kerningWindow.show()
+
     def metrics(self):
         # TODO: see up here
         if self._metricsWindow is not None and self._metricsWindow.isVisible():
@@ -915,11 +957,17 @@ class FontWindow(BaseWindow):
 
     # update methods
 
+    def _setGlyphPreview(self, value):
+        index = self.stackWidget.currentIndex()
+        if index:
+            widget = self.stackWidget.currentWidget()
+            widget.setPreviewEnabled(value)
+
     def _updateCurrentGlyph(self):
         # TODO: refactor this pattern...
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            glyph = widget.glyph()
+            glyph = widget.activeGlyph()
         else:
             glyph = widget.lastSelectedGlyph()
         if glyph is not None:
@@ -931,7 +979,7 @@ class FontWindow(BaseWindow):
             return
         widget = self.stackWidget.currentWidget()
         if self.isGlyphTab():
-            currentGlyph = widget.glyph()
+            currentGlyph = widget.activeGlyph()
         else:
             currentGlyph = widget.lastSelectedGlyph()
         # disconnect eventual signal of previous glyph
@@ -1025,7 +1073,7 @@ class FontWindow(BaseWindow):
     def event(self, event):
         if event.type() == QEvent.WindowActivate:
             app = QApplication.instance()
-            app.setCurrentMainWindow(self)
+            app.setCurrentFontWindow(self)
             self._updateCurrentGlyph()
         return super().event(event)
 

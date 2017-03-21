@@ -13,6 +13,8 @@ from trufont.objects import icons
 from trufont.tools.colorGenerator import ColorGenerator
 # TODO: switch to QFormLayout
 from trufont.tools.rlabel import RLabel
+import booleanOperations
+import itertools
 
 
 def Button(parent=None):
@@ -235,7 +237,7 @@ class PropertiesWidget(QWidget):
         unionButton.setDrawingCommands(icons.dc_union())
         unionButton.setToolTip(
             self.tr("Remove selection overlap"))
-        unionButton.clicked.connect(self.union)
+        unionButton.clicked.connect(self.removeOverlap)
         subtractButton = Button(self)
         subtractButton.setDrawingCommands(icons.dc_subtract())
         subtractButton.setToolTip(
@@ -493,17 +495,8 @@ class PropertiesWidget(QWidget):
     def writeGlyphName(self):
         if self._glyph is None:
             return
-        # TODO: should there be an API for this (e.g. glyph.rename())
-        layerSet = self._glyph.layerSet
         newName = self.nameEdit.text()
-        if layerSet is not None:
-            oldName = self._glyph.name
-            for layer in layerSet:
-                if oldName in layer:
-                    glyph = layer[oldName]
-                    glyph.name = newName
-        else:
-            self._glyph.name = newName
+        self._glyph.rename(newName)
 
     def writeUnicodes(self):
         if self._glyph is None:
@@ -622,55 +615,98 @@ class PropertiesWidget(QWidget):
         base = self.snapEdit.value()
         glyph.snap(base)
 
-    def union(self):
+    # boolean ops
+
+    def removeOverlap(self):
         # TODO: disable button instead
         glyph = self._glyph
-        if glyph is None:
+        if not glyph:
             return
-        # unselected bookkeeping
-        unselContours = []
+        glyph.prepareUndo()
+        target, others = [], []
+        useSelection = bool(glyph.selection)
         for contour in glyph:
-            if not contour.selection:
-                unselContours.append(contour)
-        partialSelection = unselContours and len(unselContours) < len(glyph)
-        if partialSelection:
-            for contour in reversed(unselContours):
-                glyph.removeContour(contour)
-        glyph.removeOverlap()
-        if partialSelection:
-            for contour in unselContours:
-                glyph.appendContour(contour)
+            if contour.open:
+                others.append(contour)
+                continue
+            if useSelection and not contour.selection:
+                others.append(contour)
+                continue
+            target.append(contour)
+        glyph.clearContours()
+        pointPen = glyph.getPointPen()
+        booleanOperations.union(target, pointPen)
+        for contour in others:
+            contour.drawPoints(pointPen)
+
+    def _binaryBooleanOperation(self, func):
+        # TODO: disable button instead
+        glyph = self._glyph
+        if glyph is None or len(glyph) < 2:
+            return
+        glyph.prepareUndo()
+        target, open_ = None, []
+        delIndex = None
+        others = list(glyph)
+        for index, contour in enumerate(glyph):
+            if contour.open:
+                open_.append(contour)
+            elif target is None and contour.selection:
+                target = contour
+                delIndex = index
+        if delIndex is not None:
+            del others[index]
+        else:
+            target = glyph[-1]
+            del others[-1]
+        glyph.clearContours()
+        pointPen = glyph.getPointPen()
+        func(others, [target], pointPen)
+        for contour in open_:
+            contour.drawPoints(pointPen)
 
     def subtract(self):
-        pass
+        self._binaryBooleanOperation(booleanOperations.difference)
 
     def intersect(self):
-        pass
+        self._binaryBooleanOperation(booleanOperations.intersection)
 
     def xor(self):
-        pass
+        self._binaryBooleanOperation(booleanOperations.xor)
+
+    # fitting
+
+    def _mirror(self, attr, origin):
+        glyph = self._glyph
+        if not glyph:
+            return
+        glyph.prepareUndo()
+        points = glyph.selection
+        useSelection = bool(points)
+        vMin = vMax = None
+        for contour in glyph:
+            for point in contour:
+                if useSelection and not point.selected:
+                    continue
+                value = getattr(point, attr)
+                if vMin is None:
+                    vMin = vMax = value
+                else:
+                    vMin = min(vMin, value)
+                    vMax = max(vMax, value)
+                if not useSelection:
+                    points.add(point)
+        f = getattr(self.alignmentWidget, origin)()
+        for point in points:
+            value = (2 - f) * vMin + f * vMax - getattr(point, attr)
+            setattr(point, attr, value)
+        glyph.dirty = True
 
     def hMirror(self):
-        glyph = self._glyph
-        if glyph is None or glyph.controlPointBounds is None:
-            return
-        glyph.prepareUndo()
-        xMin, _, xMax, _ = glyph.controlPointBounds
-        for contour in glyph:
-            for point in contour:
-                point.x = xMin + xMax - point.x
-        glyph.dirty = True
+        self._mirror("x", "hOrigin")
 
     def vMirror(self):
-        glyph = self._glyph
-        if glyph is None or glyph.controlPointBounds is None:
-            return
-        glyph.prepareUndo()
-        _, yMin, _, yMax = glyph.controlPointBounds
-        for contour in glyph:
-            for point in contour:
-                point.y = yMin + yMax - point.y
-        glyph.dirty = True
+        self._mirror("y", "vOrigin")
 
     def alignHLeft(self):
         glyph = self._glyph
@@ -849,7 +885,8 @@ class PropertiesWidget(QWidget):
         name = "New layer"  # XXX: mangle
         self._shouldEditLastName = True
         layer = font.layers.newLayer(name)
-        layer.color = ColorGenerator.getColor() + [1]
+        layer.color = tuple(
+            itertools.chain(LayerColorGenerator.getColor(), (1,)))
 
     def removeLayer(self):
         font = self._font
@@ -921,3 +958,33 @@ class PropertiesView(QScrollArea):
             self.setMinimumWidth(self.widget().minimumSizeHint().width(
                 ))  # + self.verticalScrollBar().width())
         return super().eventFilter(obj, event)
+
+# ---------------
+# Color generator
+# ---------------
+
+
+class LayerColorGenerator(ColorGenerator):
+    # precomputed colors fancy/k-means
+    colors = [
+        (185, 225, 122),
+        (158, 206, 228),
+        (233, 174, 200),
+        (227, 191, 206),
+        (130, 223, 184)
+    ]
+    index = 0
+
+    @classmethod
+    def getColor(cls):
+        if cls.index <= len(cls.colors):
+            color = (clr / 255 for clr in cls.colors[cls.index])
+        else:
+            color = ColorGenerator.getColor()
+        cls.index += 1
+        return color
+
+    @classmethod
+    def revert(cls):
+        if cls.index > 0:
+            cls.index -= 1

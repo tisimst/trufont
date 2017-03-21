@@ -1,8 +1,7 @@
-from PyQt5.QtCore import QLineF, Qt
+from PyQt5.QtCore import QLineF, QPointF, Qt
 from PyQt5.QtGui import QPainterPath
 from PyQt5.QtWidgets import QApplication
 from collections import OrderedDict
-from fontTools.pens.qtPen import QtPen
 from trufont.drawingTools.baseTool import BaseTool
 from trufont.tools import bezierMath, drawing
 
@@ -110,6 +109,7 @@ class KnifeTool(BaseTool):
             len(self._cachedIntersections) > 1
         if cutContours:
             oldPts = set(pt for contour in self._glyph for pt in contour)
+            path = self._glyph.getRepresentation("defconQt.QPainterPath")
         # reverse so as to not invalidate our cached segment indexes
         for loc, ts in reversed(list(self._cachedIntersections.items())):
             contour, index = loc
@@ -123,41 +123,41 @@ class KnifeTool(BaseTool):
             newPts = set(pt for contour in self._glyph for pt in contour
                          if pt.segmentType) - oldPts
             del oldPts
+
             distances = dict()
             for point in newPts:
                 d = bezierMath.distance(p1.x(), p1.y(), point.x, point.y)
                 distances[d] = point
-            # XXX: that model doesn't work well for winding number > 1
-            siblings = [
+            del newPts
+
+            sortedPts = [
                 distances[dist] for dist in sorted(distances.keys())]
-            if len(siblings) % 2:
-                # we have an odd number of intersections. if one end of the
-                # knife line is in a contour's "black area", elide that end
-                # from the siblings array so we just create a point.
-                # if no black area is found (open contour), fallback to eliding
-                # the last intersection.
-                def getCutIndex():
-                    for contour in self._glyph:
-                        ##
-                        # TODO: make this a repr?
-                        # path = contour.getRepresentation(
-                        #     "defconQt.QPainterPath")
-                        pen = QtPen({})
-                        contour.draw(pen)
-                        path = pen.path
-                        ##
-                        i = 0
-                        for pt in (p1, p2):
-                            if path.contains(pt):
-                                return i
-                            i -= 1
-                    return -1
-                index = getCutIndex()
-                del siblings[index]
             del distances
+
+            # group points by belonging to contour "black area"
+            siblings = []
+            stack = None
+            if not path.contains(p1):
+                stack = []
+            for pt, nextPt in zip(sortedPts, sortedPts[1:]):
+                qPt = QPointF(pt.x, pt.y)
+                qHalf = qPt + .5 * (QPointF(nextPt.x, nextPt.y) - qPt)
+                if path.contains(qHalf):
+                    if stack is not None:
+                        stack.append(pt)
+                else:
+                    if stack:
+                        stack.append(pt)
+                        siblings.extend(stack)
+                    stack = []
+            if not path.contains(p2):
+                if stack:
+                    stack.append(nextPt)
+                    siblings.extend(stack)
+            del stack
+
             # ok, now i = siblings.index(loc); siblings[i+1-2(i%2)] will yield
             # sibling
-            # nota if len(siblings) is odd then the last point has no buddy
             newGlyph = self._glyph.__class__()
             pen = newGlyph.getPointPen()
 
@@ -208,7 +208,10 @@ class KnifeTool(BaseTool):
 
     # custom painting
 
-    def paint(self, painter):
+    def paint(self, painter, index):
+        widget = self.parent()
+        if index != widget.activeIndex():
+            return
         line = self._knifeLine
         if line is not None and line.length():
             painter.save()
@@ -218,7 +221,7 @@ class KnifeTool(BaseTool):
             drawing.drawLine(
                 painter, line.x1(), line.y1(), line.x2(), line.y2())
             if self._knifePts is not None:
-                scale = self.parent().inverseScale()
+                scale = widget.inverseScale()
                 dotSize = 5 * scale
                 dotHalf = dotSize / 2
                 path = QPainterPath()
